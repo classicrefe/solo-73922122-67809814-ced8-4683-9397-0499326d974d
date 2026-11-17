@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 INIT_SQL = Path(__file__).resolve().parents[1] / "sql" / "init.sql"
+AUDIT_SQL = Path(__file__).resolve().parents[1] / "sql" / "audit.sql"
 
 
 def _can_connect(dsn: str) -> bool:
@@ -51,28 +52,41 @@ def _init_schema(pg_dsn: str) -> None:
     conn = psycopg.connect(pg_dsn, autocommit=True)
     try:
         conn.execute(INIT_SQL.read_text(encoding="utf-8"))
+        conn.execute(AUDIT_SQL.read_text(encoding="utf-8"))
     finally:
         conn.close()
 
 
 @pytest.fixture()
 def client(pg_dsn, monkeypatch):
-    """每个测试拿到干净的 JobManager 与 TestClient。"""
+    """每个测试拿到干净的 JobManager / 日核查管理器与 TestClient。"""
     monkeypatch.setenv("PG_DSN", pg_dsn)
     monkeypatch.setenv("WORK_DIR", "/tmp/recon-test-work")
 
     from app import config as config_mod
+    from app import daily_audit as daily_audit_mod
+    from app import daily_manager as daily_manager_mod
     from app import manager as manager_mod
     from app.main import app
 
     # settings 在导入时定型，这里直接改运行期单例字段
     monkeypatch.setattr(config_mod.settings, "pg_dsn", pg_dsn)
     monkeypatch.setattr(config_mod.settings, "work_dir", "/tmp/recon-test-work")
+    monkeypatch.setattr(config_mod.settings, "max_gap_minutes", 120)
+    monkeypatch.setattr(config_mod.settings, "max_anomalies", 20)
+
+    # 报告存储跟随测试 DSN，保证读写同一个库
+    monkeypatch.setattr(daily_audit_mod.store, "_dsn", pg_dsn)
+    monkeypatch.setattr("app.main.daily_store", daily_audit_mod.store)
 
     # 替换为全新管理器，保证测试间互不占用名额
     fresh = manager_mod.JobManager()
     monkeypatch.setattr(manager_mod, "manager", fresh)
     monkeypatch.setattr("app.main.manager", fresh)
+
+    fresh_daily = daily_manager_mod.DailyAuditManager()
+    monkeypatch.setattr(daily_manager_mod, "daily_manager", fresh_daily)
+    monkeypatch.setattr("app.main.daily_manager", fresh_daily)
 
     from fastapi.testclient import TestClient
 

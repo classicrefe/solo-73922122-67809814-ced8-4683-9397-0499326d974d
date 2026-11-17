@@ -6,8 +6,9 @@ services:
       POSTGRES_PASSWORD: recon
       POSTGRES_DB: recon
     volumes:
-      # 仅首次启动自动执行初始化 SQL
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # 首次启动自动执行（init.sql 后接 audit.sql 的报告结构）
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./sql/audit.sql:/docker-entrypoint-initdb.d/02-audit.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U recon -d recon"]
@@ -34,6 +35,8 @@ services:
       MAX_DIFF_TYPES: "20"
       WORK_DIR: /tmp/recon-work
       PG_STATEMENT_TIMEOUT_MS: "28000"
+      MAX_GAP_MINUTES: "120"
+      MAX_ANOMALIES_SHOWN: "20"
     ports:
       - "8000:8000"
     volumes:

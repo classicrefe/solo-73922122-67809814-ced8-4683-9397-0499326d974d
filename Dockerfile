@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /tmp/recon-work && chown recon:recon /tmp/recon-work
 
 COPY app ./app
+# 报告结构/触发器：应用启动时读取并幂等执行
+COPY sql ./sql
 
 USER recon
 EXPOSE 8000

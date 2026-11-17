@@ -13,8 +13,16 @@ docker compose up --build
 # 文档:  http://localhost:8000/docs   （Swagger UI，可直接发请求演示）
 ```
 
-启动后 PostgreSQL 自动执行 `sql/init.sql`，建好 `meters` / `readings`
-源表并写入示例数据；文件末尾附有可直接粘贴到 `/docs` 的两条等价示例查询。
+启动后 PostgreSQL 自动执行 `sql/init.sql`（源表 + 示例数据 + 示例查询）和
+`sql/audit.sql`（日核查报告表与过期检测触发器）；应用启动时也会再幂等执行
+一次 `sql/audit.sql`，已有数据卷无需手动迁移。示例数据包含：
+
+- `2026-11-15`：三条 `SELECT` 核对演示用的正常读数；
+- `2026-11-16`：日核查演示日，故意包含**读数回退**（1002）、**间隔 3 小时**
+  （2001）以及**当天无读数的表**（3001），因此核查结论为不可用。
+
+可直接在 `/docs` 里演示：`POST /daily-audits?date=2026-11-16`，再
+`GET /daily-reports?date=2026-11-16`。
 
 停止并清理：
 
@@ -31,9 +39,17 @@ docker compose down -v
 | `GET`  | `/jobs` | 列出近期任务（含终态），状态查询始终可用 |
 | `GET`  | `/jobs/{job_id}` | 查询单个任务状态与结论 |
 | `POST` | `/jobs/{job_id}/cancel` | 请求取消，及时受理 |
+| `POST` | `/daily-audits?date=YYYY-MM-DD` | 发起某 UTC 日期的读数核查（同一时刻只允许一个日核查） |
+| `GET`  | `/daily-audits/{audit_id}` | 查询日核查任务状态与结果 |
+| `POST` | `/daily-audits/{audit_id}/cancel` | 请求取消日核查 |
+| `GET`  | `/daily-reports?date=YYYY-MM-DD` | 按日期查询最近一次成功的核查报告（含实时过期标记） |
+| `GET`  | `/daily-reports/latest?date=YYYY-MM-DD` | 按日期查询最新一次尝试（含 running/failed/aborted） |
+| `GET`  | `/daily-reports/history?date=YYYY-MM-DD` | 按日期查看历次尝试 |
+| `GET`  | `/daily-reports/{report_id}` | 按报告 ID 查询（历史报告可查，过期状态实时计算） |
 
 任务状态：`pending → running →（cancelling）→ succeeded | failed | cancelled | timeout`。
 失败、取消、超时一律 **不发布比较结论**（`result` 为 `null`），仅给出原因。
+日核查任务状态另有 `aborted`（扫描途中源表被更正或报告保存失败）。
 
 ### 请求示例
 
@@ -102,7 +118,112 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 - 严格按顺序收尾：**中止 SQL → 关闭连接 → 清空暂存目录 → 释放名额 → 才落终态**，
   因此状态查询一旦看到终态，名额必然已经释放、暂存必然已经清空。
 
-## 5. 配置（环境变量）
+## 5. 按 UTC 日期核查日结读数
+
+### 判定口径
+
+对 `date` 当天的 UTC 区间 `[00:00:00Z, 次日 00:00:00Z)`：
+
+1. 每块表按 `read_time` 升序，逐对比较**相邻两条累计 Wh**；
+2. 后一条 `<` 前一条 → 记“读数回退”；
+3. 相邻间隔 > `MAX_GAP_MINUTES`（默认 120 分钟）→ 记“间隔超过 2 小时”；
+4. 同一条读数两种条件都满足时只记一条异常，`reasons` 同时给出；
+5. 每块表当天的**首条读数不接前一天**，不参与跨日比较；
+6. `meters` 表中任何一块表当天没有读数 → **不能判定为可用**；
+7. 当天完全没有读数、或表计档案为空 → 同样不可用；
+8. 报告给出全量异常总数，并最多展示排序后的前 20 条
+   （表号、前后时刻、前后读数、间隔秒数、原因），按 `(表号, 当前时刻)` 排序。
+
+### 接口
+
+```bash
+# 发起核查（返回 audit_id，异步执行）
+curl -X POST 'http://localhost:8000/daily-audits?date=2026-11-16'
+
+# 轮询任务；完成后 report 即为已持久化的报告
+curl 'http://localhost:8000/daily-audits/{audit_id}'
+
+# 按日期查询最近一次成功报告（stale 为实时计算的过期标记）
+curl 'http://localhost:8000/daily-reports?date=2026-11-16'
+
+# 最新一次尝试（可能是 running / failed / aborted）、历次尝试、按 ID 查询
+curl 'http://localhost:8000/daily-reports/latest?date=2026-11-16'
+curl 'http://localhost:8000/daily-reports/history?date=2026-11-16'
+curl 'http://localhost:8000/daily-reports/{report_id}'
+```
+
+报告核心字段：
+
+```json
+{
+  "audit_date": "2026-11-16",
+  "status": "succeeded",
+  "usable": false,
+  "usable_reason": "发现 2 条相邻读数异常；7 块表当天无读数，不能判定为可用",
+  "stale": false,
+  "settlement_usable": false,
+  "anomaly_total": 2,
+  "meters_total": 12,
+  "meters_with_readings": 5,
+  "meters_without_readings": [{"meter_id": 1001, "line_name": "A线"}],
+  "anomalies": [
+    {
+      "seq": 1, "meter_id": 4002,
+      "previous_time": "2026-11-16T09:00:00Z", "previous_wh": 1000,
+      "current_time": "2026-11-16T10:00:00Z", "current_wh": 850,
+      "gap_seconds": 3600, "reasons": ["rollback"],
+      "reason_text": "读数回退"
+    },
+    {
+      "seq": 2, "meter_id": 4003,
+      "previous_time": "2026-11-16T08:00:00Z", "previous_wh": 2300,
+      "current_time": "2026-11-16T11:00:00Z", "current_wh": 2600,
+      "gap_seconds": 10800, "reasons": ["gap"],
+      "reason_text": "间隔超过 120 分钟"
+    }
+  ]
+}
+```
+
+`settlement_usable` 是“能否直接拿去做结算”的唯一判断：需要
+`status=succeeded` 且 `usable=true`、`stale=false`，并且该日期**最新一次
+尝试**也是成功。任何一次失败/中止的尝试都会阻断旧报告的可用标记，
+直到重新核查成功后才恢复。
+
+### 同一已提交快照
+
+- 核查在单个 `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` 事务内完成，
+  事务开头先取当天版本号，因此扫描到的数据与记录的 `source_version` 来自同一快照；
+- 扫描期间其他会话的更正照常提交，但对本轮不可见。
+
+### 过期：任何已提交改动（含直接 SQL）
+
+`sql/audit.sql` 在 `readings` 上按**语句级 transition table** 建触发器，
+把受影响 UTC 日期的版本号 +1，不按行放大：
+
+| 操作 | 过期日期 |
+| --- | --- |
+| `INSERT` | 新读了所在的 UTC 日 |
+| `DELETE` | 被删读数所在的 UTC 日 |
+| `UPDATE` | OLD 与 NEW 的 UTC 日**都**标记（读数跨日移动时两天都过期） |
+| `TRUNCATE` | 清空前仍存在的全部日期 |
+
+触发器和报告表由应用启动时幂等执行 `sql/audit.sql` 建立，因此**绕过应用、
+直接连库执行 SQL** 同样会让旧报告失效。查询时把报告的 `source_version`
+与当前版本比较，不同即返回 `stale=true` 并给出原因；历史报告仍可查看，
+但 `settlement_usable=false`。
+
+### 扫描途中更正 / 报告保存失败
+
+- 报告先以 `running` 落库，只有全部校验通过才在同一个事务里改成 `succeeded`；
+- 保存前对当天版本行 `FOR SHARE` 并复核版本：若扫描开始后有更正提交，
+  版本不一致，整个尝试记为 `aborted`，**不发布任何结论**；
+- 报告写入失败同样回滚，尝试记为 `aborted`，旧报告因“最新一次尝试失败”
+  而 `settlement_usable=false`，直到重查成功才恢复；
+- 取消/超时：任务终态为 `cancelled`/`timeout`，尝试置为 `failed`，
+  同样不发布结论。
+
+## 6. 配置（环境变量）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -112,8 +233,11 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 | `SORT_CHUNK_ROWS` | `20000` | 单个排序块行数 |
 | `MAX_DIFF_TYPES` | `20` | 差异展示上限 |
 | `WORK_DIR` | `/tmp/recon-work` | 外部排序暂存目录（独立卷） |
+| `MAX_GAP_MINUTES` | `120` | 相邻读数视为异常的最大间隔（分钟） |
+| `MAX_ANOMALIES_SHOWN` | `20` | 日核查报告展示的异常条数上限 |
+| `DAILY_READ_CHUNK_ROWS` | `50000` | 日核查流式读取每批行数 |
 
-## 6. 本地自测
+## 7. 本地自测
 
 ```bash
 # 单元 + 集成测试（集成测试需要一个 PostgreSQL；可用 PG_DSN 指定）
@@ -121,13 +245,16 @@ python -m pytest tests/ -q
 
 # 50 万行级端到端压测（内存峰值、暂存占用、结论正确性、清理与名额释放）
 python scripts/load_test.py
+
+# 日核查专项测试（按 UTC 日、异常明细、过期、扫描中更正、保存失败）
+python -m pytest tests/test_daily_audit.py -q
 ```
 
 实测（受限沙箱环境，容器内通常更快）：两侧各 504,012 行、
 含一次重复计入差异，端到端约 16 秒，进程峰值 RSS 约 68 MiB，
 暂存峰值约 44 MiB，结束后暂存目录清空、名额释放。
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 app/
@@ -136,9 +263,12 @@ app/
   db.py              快照会话、只读连接、命名游标流式拉取、列类型闸门
   external_merge.py  流式 run、k 路归并、多重集核对
   manager.py         单名额编排、看门狗、取消/超时/失败的统一收尾
+  daily_audit.py     按 UTC 日核查、报告读写、过期判定
+  daily_manager.py   日核查单名额编排、取消/超时/失败语义
   models.py          API 模型
   main.py            FastAPI 路由
 sql/init.sql         源表、示例数据、示例查询
+sql/audit.sql        报告/版本表结构、过期检测触发器（启动时幂等执行）
 scripts/             压测数据生成与负载脚本
 tests/               单元与集成测试
 docker-compose.yml   应用（128MiB 上限）+ PostgreSQL

@@ -54,6 +54,11 @@ def _open_connection() -> psycopg.Connection:
     return conn
 
 
+def open_connection() -> psycopg.Connection:
+    """打开一条已配置超时/只读约束之外的普通连接（供核查与报告读写使用）。"""
+    return _open_connection()
+
+
 class SnapshotSession:
     """管理同一快照下的两条只读读取连接。"""
 

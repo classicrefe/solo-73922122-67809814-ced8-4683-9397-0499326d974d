@@ -42,5 +42,15 @@ class Settings:
     # 允许出现在结果集中的列类型（PostgreSQL 类型名 -> psycopg 加载后的 Python 类型）
     allowed_pg_types: tuple[str, ...] = ("bigint", "text")
 
+    # ---------- 日结读数核查 ----------
+    # 相邻有效读数允许的最大间隔（分钟），超过即记为异常
+    max_gap_minutes: int = _env_int("MAX_GAP_MINUTES", 120)
+    # 报告最多展示的异常条数
+    max_anomalies: int = _env_int("MAX_ANOMALIES_SHOWN", 20)
+    # 报告表所在 schema（启动时自动建表）
+    report_schema: str = _env("REPORT_SCHEMA", "recon")
+    # 读取日核查数据的连接：单条连接、快照内一致读取
+    daily_read_chunk_rows: int = _env_int("DAILY_READ_CHUNK_ROWS", 50000)
+
 
 settings = Settings()
